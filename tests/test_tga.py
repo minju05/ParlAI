@@ -10,12 +10,14 @@ import unittest
 import math
 import torch
 from parlai.core.agents import create_agent
+from parlai.core.dict import DictionaryAgent
 import parlai.utils.testing as testing_utils
 from parlai.core.params import ParlaiParser
 from parlai.core.torch_generator_agent import (
     BeamSearch,
     GreedySearch,
     NucleusSampling,
+    FactualNucleusSampling,
     TopKSampling,
     TorchGeneratorAgent,
 )
@@ -129,25 +131,31 @@ class TestGeneration(unittest.TestCase):
         obs = {'text': '1 2 3 4 ' * 256, 'episode_done': False}
         agent.observe(obs)
         batch = agent.batchify([agent.observation])
-        self.assertEqual(agent._get_context(batch, 0).tolist(), [5, 4, 6, 7] * 256)
+        self.assertEqual(
+            agent._get_batch_context(batch)[0].tolist(), [5, 4, 6, 7] * 256
+        )
 
         # observe 1 more obs, context is the same (truncation)
         agent.observe(obs)
         batch = agent.batchify([agent.observation])
-        self.assertEqual(agent._get_context(batch, 0).tolist(), [5, 4, 6, 7] * 256)
+        self.assertEqual(
+            agent._get_batch_context(batch)[0].tolist(), [5, 4, 6, 7] * 256
+        )
 
         # Now, set agent's beam_block_full_context
         args += ['--beam-block-full-context', 'true']
         agent2 = create_agent(pp.parse_args(args), True)
         agent2.observe(obs)
         batch = agent2.batchify([agent2.observation])
-        self.assertEqual(agent2._get_context(batch, 0).tolist(), [5, 4, 6, 7] * 256)
+        self.assertEqual(
+            agent2._get_batch_context(batch)[0].tolist(), [5, 4, 6, 7] * 256
+        )
 
         # observe 1 more obs, context is larger now
         agent2.observe(obs)
         batch = agent2.batchify([agent2.observation])
         self.assertEqual(
-            agent2._get_context(batch, 0).tolist(),
+            agent2._get_batch_context(batch)[0].tolist(),
             [5, 4, 6, 7] * 256 + [3] + [5, 4, 6, 7] * 256,
         )  # 3 is end token.
 
@@ -186,7 +194,14 @@ class TestGeneration(unittest.TestCase):
         Regression for all inference types: 'beam', 'greedy', 'topk', 'nucleus',
         'delayedbeam'
         """
-        inference_types = ['beam', 'greedy', 'topk', 'nucleus', 'delayedbeam']
+        inference_types = [
+            'beam',
+            'greedy',
+            'topk',
+            'nucleus',
+            'factual_nucleus',
+            'delayedbeam',
+        ]
         gold_data = {
             'beam': {
                 'text_token_info': [
@@ -210,6 +225,10 @@ class TestGeneration(unittest.TestCase):
             # sampling based token selection will produce non-deterministic output, so we can't do data regression
             'nucleus': {'extra_args': ['--topp', '0.3']},
             'nucleus_multiple_beams': {
+                'extra_args': ['--topp', '0.3', '--beam-size', '5']
+            },
+            'factual_nucleus': {'extra_args': ['--topp', '0.3']},
+            'factual_nucleus_multiple_beams': {
                 'extra_args': ['--topp', '0.3', '--beam-size', '5']
             },
             # sampling based token selection will produce non-deterministic output, so we can't do data regression
@@ -257,6 +276,10 @@ class TestGeneration(unittest.TestCase):
         """
         Unit test `select_paths` for different decoding schemes.
         """
+        parser = ParlaiParser()
+        DictionaryAgent.add_cmdline_args(parser, partial_opt=None)
+        opt = parser.parse_args([])
+        dictionary = DictionaryAgent(opt)
         tests = {
             "greedy": {
                 "obj": GreedySearch(beam_size=1, verbose=True),
@@ -350,6 +373,58 @@ class TestGeneration(unittest.TestCase):
             },
             "nucleus_with_multiple_beams": {
                 "obj": NucleusSampling(beam_size=2, p=0.9, verbose=True),
+                "logprobs": torch.Tensor(
+                    [
+                        [-float('inf'), -0.5, -float('inf'), -float('inf')],
+                        [-float('inf'), -float('inf'), -0.6, -float('inf')],
+                    ]
+                ),
+                "prior_scores": torch.Tensor([-3.0, -2.0]),
+                "expected_result": {
+                    "hypothesis_ids": torch.LongTensor([0, 1]),
+                    "token_ids": torch.LongTensor([1, 2]),
+                    "scores": torch.Tensor(
+                        [-3.0, -2.0]
+                    ),  # the -0.5, -0.6 logprobs normalize to 0 in truncated distributions
+                    "token_details": [
+                        {"token_logprob": 0.0, "token_rank": 0},
+                        {"token_logprob": 0.0, "token_rank": 0},
+                    ],
+                },
+            },
+            "factual_nucleus_with_one_beam": {
+                "obj": FactualNucleusSampling(
+                    p=0.9,
+                    lambda_decay=0.9,
+                    omega_bound=0.3,
+                    p_reset=True,
+                    beam_size=1,
+                    verbose=True,
+                    dict=dictionary,
+                ),
+                "logprobs": torch.Tensor(
+                    [[-float('inf'), -0.5, -float('inf'), -float('inf')]]
+                ),
+                "prior_scores": torch.Tensor([-3.0]),
+                "expected_result": {
+                    "hypothesis_ids": torch.LongTensor([0]),
+                    "token_ids": torch.LongTensor([1]),
+                    "scores": torch.Tensor(
+                        [-3.0]
+                    ),  # the -0.5 logprob normalizes to 0 in truncated distribution
+                    "token_details": [{"token_logprob": 0.0, "token_rank": 0}],
+                },
+            },
+            "factual_nucleus_with_multiple_beams": {
+                "obj": FactualNucleusSampling(
+                    p=0.9,
+                    lambda_decay=0.9,
+                    omega_bound=0.3,
+                    p_reset=True,
+                    beam_size=2,
+                    verbose=True,
+                    dict=dictionary,
+                ),
                 "logprobs": torch.Tensor(
                     [
                         [-float('inf'), -0.5, -float('inf'), -float('inf')],

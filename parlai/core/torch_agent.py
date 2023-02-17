@@ -36,7 +36,13 @@ from parlai.core.message import Message
 from parlai.utils.distributed import is_distributed
 from parlai.utils.misc import AttrDict, warn_once
 from parlai.utils.io import PathManager
-from parlai.utils.fsdp import should_sync_gradnorm, is_fsdp, DEFAULT_DDP_BACKEND
+from parlai.utils.fsdp import (
+    should_sync_gradnorm,
+    is_fsdp,
+    DEFAULT_DDP_BACKEND,
+    FSDP_AVAILABLE,
+    get_state_dict,
+)
 from parlai.utils.fp16 import (
     SafeFP16Optimizer,
     MemoryEfficientFP16Optimizer,
@@ -983,7 +989,6 @@ class TorchAgent(ABC, Agent):
             boolean indicating whether the optimizer failed to initialize with
             optim_states.
         """
-
         if hasattr(self, 'resized_embeddings') and self.resized_embeddings:
             optim_states = None
             logging.warning('Not loading optimizer due to resize in token embeddings')
@@ -1982,8 +1987,11 @@ class TorchAgent(ABC, Agent):
             if hasattr(self.model, 'module') and not is_fsdp(self.model):
                 # did we wrap in a DistributedDataParallel or DataParallel
                 states['model'] = self.model.module.state_dict()
+            elif is_fsdp(self.model) and FSDP_AVAILABLE:
+                # FSDP Model; use fancy saving
+                states['model'] = get_state_dict(self.model)
             else:
-                # regular model or FSDP
+                # regular model
                 states['model'] = self.model.state_dict()
 
         if hasattr(self, 'optimizer'):
@@ -2145,6 +2153,7 @@ class TorchAgent(ABC, Agent):
         """
         # BatchWorld handles calling self_observe, but we're in a Hogwild or Interactive
         # world, so we need to handle this ourselves.
+
         response = self.batch_act([self.observation])[0]
         self.self_observe(response)
         return response
@@ -2180,7 +2189,7 @@ class TorchAgent(ABC, Agent):
 
         self.is_training = batch.is_training
 
-        # truncation statistics
+        #  truncation statistics
         if batch._context_original_length is not None:
             self.record_local_metric(
                 'clen', AverageMetric.many(batch._context_original_length)
@@ -2251,7 +2260,7 @@ class TorchAgent(ABC, Agent):
         for k, values in self._local_metrics.items():
             if len(values) != len(batch.valid_indices):
                 raise IndexError(
-                    f"Batchsize mismatch on metric {k} got {len(values)}, "
+                    f"Batchsize mismatch on metric {k} (got {len(values)}, "
                     f"expected {len(batch.valid_indices)}"
                 )
             for i, value in zip(batch.valid_indices, values):
@@ -2296,7 +2305,7 @@ class TorchAgent(ABC, Agent):
             # Only print in the non-shared version.
             logging.info(f'{self.id}: full interactive mode on.')
 
-    def backward(self, loss):
+    def backward(self, loss, **kwargs):
         """
         Perform a backward pass.
 
@@ -2316,15 +2325,15 @@ class TorchAgent(ABC, Agent):
                 # accumulate without syncing
                 with self.model.no_sync():
                     if self.fp16:
-                        self.optimizer.backward(loss, update_main_grads=False)
+                        self.optimizer.backward(loss, update_main_grads=False, **kwargs)
                     else:
-                        loss.backward()
+                        loss.backward(**kwargs)
                 return
 
         if self.fp16:
-            self.optimizer.backward(loss, update_main_grads=False)
+            self.optimizer.backward(loss, update_main_grads=False, **kwargs)
         else:
-            loss.backward()
+            loss.backward(**kwargs)
 
     def update_params(self):
         """
